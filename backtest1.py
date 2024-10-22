@@ -11,7 +11,7 @@ import os
 import sys
 
 class CryptoTradingBot:
-    def __init__(self, data_path, n_neighbors=5, initial_balance=10000):
+    def __init__(self, data_path, n_neighbors=5, initial_balance=10000, prediction_window=12, min_price_change=0.02):
         """
         Initialize the trading bot
         
@@ -19,6 +19,8 @@ class CryptoTradingBot:
         data_path: Path to the CSV file containing trading data
         n_neighbors: Number of neighbors for KNN algorithm
         initial_balance: Initial balance for backtesting
+        prediction_window: Number of periods to look ahead for prediction (e.g., 12 hours)
+        min_price_change: Minimum price change to consider for trade signal (e.g., 0.02 for 2%)
         """
         self.data_path = Path(data_path)
         self.model = KNeighborsClassifier(
@@ -28,110 +30,108 @@ class CryptoTradingBot:
         )
         self.scaler = StandardScaler()
         self.initial_balance = initial_balance
+        self.prediction_window = prediction_window
+        self.min_price_change = min_price_change
         
     def load_data(self):
         """Load and preprocess data from CSV file"""
-        # Read CSV file
         df = pd.read_csv(self.data_path)
-        
-        # Convert timestamp to datetime
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # Sort by timestamp
         df = df.sort_values('timestamp')
-        
-        # Reset index
-        df = df.reset_index(drop=True)
-        
-        return df
+        return df.reset_index(drop=True)
     
     def add_features(self, df):
         """Add technical indicators as features"""
-        # Create a copy of the dataframe to avoid modifying the original
         df = df.copy()
         
-        # Calculate VWAP first - using proper ffill method
+        # Calculate VWAP
         df['vwap'] = (df['turnover'].div(df['volume'])).ffill()
         
-        # Price-based indicators
-        df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
-        df['macd'] = ta.trend.MACD(df['close']).macd()
-        df['macd_signal'] = ta.trend.MACD(df['close']).macd_signal()
-        df['macd_diff'] = ta.trend.MACD(df['close']).macd_diff()
+        # Longer-term moving averages
+        df['sma_50'] = df['close'].rolling(window=50).mean()
+        df['sma_200'] = df['close'].rolling(window=200).mean()
+        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
         
-        # Bollinger Bands
-        bb = ta.volatility.BollingerBands(df['close'])
+        # Price-based indicators with longer windows
+        df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        df['rsi_slow'] = ta.momentum.RSIIndicator(df['close'], window=21).rsi()
+        
+        macd = ta.trend.MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_diff'] = macd.macd_diff()
+        
+        # Bollinger Bands with longer window
+        bb = ta.volatility.BollingerBands(df['close'], window=20)
         df['bb_high'] = bb.bollinger_hband()
         df['bb_mid'] = bb.bollinger_mavg()
         df['bb_low'] = bb.bollinger_lband()
         df['bb_width'] = (df['bb_high'] - df['bb_low']) / df['bb_mid']
         
+        # Trend strength indicators
+        df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+        
         # Volume-based indicators
         df['volume_sma'] = df['volume'].rolling(window=20).mean()
         df['volume_std'] = df['volume'].rolling(window=20).std()
+        df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
         
-        # Additional momentum indicators
-        df['stoch_k'] = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close']).stoch()
-        df['stoch_d'] = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close']).stoch_signal()
+        # Price and volume changes over multiple periods
+        for period in [3, 6, 12, 24]:
+            df[f'price_change_{period}'] = df['close'].pct_change(periods=period)
+            df[f'volume_change_{period}'] = df['volume'].pct_change(periods=period)
         
-        # Price and volume changes
-        df['price_change'] = df['close'].pct_change()
-        df['volume_change'] = df['volume'].pct_change()
-        
-        # Rolling metrics
+        # Volatility
         df['volatility'] = df['close'].rolling(window=20).std()
-        df['price_range'] = (df['high'] - df['low']) / df['close']
+        df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
         
-        # Handle any remaining NaN values
-        df = df.ffill().bfill()
-        
-        return df
+        return df.ffill().bfill()
 
-    def backtest(self, train_size=0.7):
-        """
-        Perform backtesting of the trading strategy
+    def prepare_data(self, df):
+        """Prepare features and target for ML model"""
+        # Calculate future returns for the prediction window
+        future_returns = df['close'].pct_change(periods=self.prediction_window).shift(-self.prediction_window)
         
-        Parameters:
-        train_size: Proportion of data to use for training
-        
-        Returns:
-        DataFrame with backtesting results and performance metrics
-        """
-        # Load and prepare data
-        df = self.load_data()
-        df = self.add_features(df)
+        # Create target variable (1 if price increases by min_price_change, 0 otherwise)
+        df['target'] = (future_returns > self.min_price_change).astype(int)
         
         feature_columns = [
-            'rsi', 'macd', 'macd_signal', 'macd_diff',
+            'rsi', 'rsi_slow', 'macd', 'macd_signal', 'macd_diff',
             'bb_high', 'bb_mid', 'bb_low', 'bb_width',
-            'stoch_k', 'stoch_d',
-            'price_change', 'volume_change',
-            'volatility', 'price_range',
-            'vwap', 'volume_sma', 'volume_std'
+            'adx', 'volume_sma', 'volume_std', 'obv',
+            'price_change_3', 'price_change_6', 'price_change_12', 'price_change_24',
+            'volume_change_3', 'volume_change_6', 'volume_change_12', 'volume_change_24',
+            'volatility', 'atr',
+            'vwap'
         ]
         
-        # Initialize backtesting results
+        return df[feature_columns], df['target']
+
+    def backtest(self):
+        """Perform backtesting of the trading strategy"""
+        df = self.load_data()
+        df = self.add_features(df)
+        X, y = self.prepare_data(df)
+        
+        # Remove rows with NaN values
+        valid_indices = ~(X.isna().any(axis=1) | y.isna())
+        X = X[valid_indices]
+        y = y[valid_indices]
+        df = df[valid_indices].copy()
+        
+        # Initialize results
         results = []
         balance = self.initial_balance
-        position = 0  # 0: No position, 1: Long, -1: Short
+        position = 0
         entry_price = 0
         trades = []
         
-        # Create time series split for walk-forward optimization
+        # Create time series split
         tscv = TimeSeriesSplit(n_splits=5)
         
-        # Walk-forward backtesting
-        for train_index, test_index in tscv.split(df):
-            # Split data
-            train_df = df.iloc[train_index]
-            test_df = df.iloc[test_index]
-            
-            # Prepare and scale features
-            X_train = train_df[feature_columns]
-            y_train = (train_df['close'].shift(-1) > train_df['close']).astype(int)[:-1]
-            X_train = X_train[:-1]
-            
-            X_test = test_df[feature_columns]
+        for train_index, test_index in tscv.split(X):
+            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+            y_train, y_test = y.iloc[train_index], y.iloc[test_index]
             
             # Scale features
             X_train_scaled = self.scaler.fit_transform(X_train)
@@ -140,22 +140,24 @@ class CryptoTradingBot:
             # Train model
             self.model.fit(X_train_scaled, y_train)
             
-            # Make predictions on test set
+            # Make predictions
             predictions = self.model.predict(X_test_scaled)
             probabilities = self.model.predict_proba(X_test_scaled)
             
-            # Simulate trading
-            for i in range(len(test_df)):
-                current_price = test_df.iloc[i]['close']
-                current_time = test_df.iloc[i]['timestamp']
+            # Trading simulation with stricter conditions
+            for i in range(len(test_index)):
+                current_price = df.iloc[test_index[i]]['close']
+                current_time = df.iloc[test_index[i]]['timestamp']
                 
                 if i < len(predictions):
                     prediction = predictions[i]
                     probability = probabilities[i][prediction]
                     
-                    # Trading logic
+                    # Trading logic with stricter conditions
                     if position == 0:  # No position
-                        if prediction == 1 and probability > 0.65:  # Buy signal
+                        if (prediction == 1 and 
+                            probability > 0.75 and  # Increased confidence threshold
+                            df.iloc[test_index[i]]['adx'] > 25):  # Strong trend condition
                             position = 1
                             entry_price = current_price
                             trades.append({
@@ -166,7 +168,9 @@ class CryptoTradingBot:
                             })
                     elif position == 1:  # Long position
                         # Exit conditions
-                        if prediction == 0 or (current_price - entry_price) / entry_price < -0.02:  # Stop loss at 2%
+                        if (prediction == 0 or 
+                            (current_price - entry_price) / entry_price < -0.02 or  # Stop loss
+                            (current_price - entry_price) / entry_price > 0.04):    # Take profit
                             pnl = (current_price - entry_price) / entry_price * balance
                             balance += pnl
                             position = 0
@@ -177,7 +181,6 @@ class CryptoTradingBot:
                                 'pnl': pnl
                             })
                 
-                # Record daily results
                 results.append({
                     'timestamp': current_time,
                     'price': current_price,
@@ -187,10 +190,9 @@ class CryptoTradingBot:
                     'probability': probability if i < len(predictions) else None
                 })
         
-        # Convert results to DataFrame
         results_df = pd.DataFrame(results)
         trades_df = pd.DataFrame(trades)
-        
+
         # Calculate performance metrics
         performance_metrics = self.calculate_performance_metrics(results_df, trades_df)
         
@@ -198,7 +200,7 @@ class CryptoTradingBot:
         self.plot_backtesting_results(results_df, trades_df)
         
         return results_df, trades_df, performance_metrics
-
+    
     def calculate_performance_metrics(self, results_df, trades_df):
         """Calculate various performance metrics"""
         initial_balance = self.initial_balance
@@ -271,13 +273,14 @@ class CryptoTradingBot:
         plt.tight_layout()
         plt.show()
 
-
 if __name__ == "__main__":
     # Initialize bot with path to data
     bot = CryptoTradingBot(
-        data_path='data/SOLUSDT_60_data.csv',
+        data_path='data/BTCUSDT_60_data.csv',
         n_neighbors=5,
-        initial_balance=10000
+        initial_balance=10000,
+        prediction_window=6,  # Predict 12 hours ahead
+        min_price_change=0.01  # Look for 2% moves
     )
     
     # Run backtest
@@ -287,7 +290,3 @@ if __name__ == "__main__":
     print("\nPerformance Metrics:")
     for metric, value in metrics.items():
         print(f"{metric}: {value:.2f}")
-    
-    # Print sample of trades
-    print("\nSample of Trades:")
-    print(trades_df.head())
