@@ -1,3 +1,5 @@
 venv
 .env
 data
+results
+trading_bot.log
